@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -535,32 +534,26 @@ SNOY, US88636J7744</textarea>
     const body = { ticker, isin, name };
     if (accessPassword) body.password = accessPassword;
 
-    let resp;
-    try {
-      resp = await fetch('/.netlify/functions/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-    } catch (networkErr) {
-      throw new Error('Network error — cannot reach server. (' + networkErr.message + ')');
-    }
-
-    let data = {};
-    try { data = await resp.json(); } catch (_) { throw new Error('Server returned non-JSON (HTTP ' + resp.status + ')'); }
+    const resp = await fetch('/.netlify/functions/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
 
     if (resp.status === 401) {
-      if (!accessPassword || (data.error && data.error.toLowerCase().includes('password'))) throw new Error('PASSWORD_REQUIRED');
-      throw new Error('Unauthorized: ' + (data.error || 'check password'));
+      const data = await resp.json();
+      if (data.error && data.error.includes('password')) {
+        throw new Error('PASSWORD_REQUIRED');
+      }
+      throw new Error('Unauthorized: ' + data.error);
     }
 
-    if (!resp.ok) throw new Error(data.error || 'Server error ' + resp.status);
-
-    if (!data.ticker && !data.fund_name && !data.distributions) {
-      throw new Error('Unexpected server response: ' + JSON.stringify(data).slice(0, 150));
+    if (!resp.ok) {
+      const data = await resp.json();
+      throw new Error(data.error || 'Server error ' + resp.status);
     }
 
-    return data;
+    return await resp.json();
   }
 
   function stopAnalysis() { stopped = true; }
@@ -621,142 +614,107 @@ SNOY, US88636J7744</textarea>
 
   // ─── Table rendering ──────────────────────────────────────────────────────
   function allCodes(r) {
-    const codes = new Set();
-    (r.distributions || []).forEach(d => (d.components || []).forEach(c => { if (c.income_code) codes.add(c.income_code); }));
-    return [...codes];
+    const s = new Set();
+    (r.distributions||[]).forEach(d=>(d.components||[]).forEach(c=>{if(c.income_code)s.add(c.income_code);}));
+    return [...s];
   }
-
   function filteredResults() {
     if (currentFilter === 'high') return results.filter(r => r.reclassification_risk === 'high');
     if (currentFilter === 'reclassified') return results.filter(r => r.distributions?.some(d => d.reclassified));
     return results;
   }
-
-  function fmtAmount(v) {
-    if (v === null || v === undefined) return '<span style="color:var(--text-muted)">—</span>';
-    return '$' + Number(v).toFixed(4);
+  function fmtAmt(v) {
+    if (v===null||v===undefined) return '<span style="color:var(--text-muted)">—</span>';
+    return '$'+Number(v).toFixed(4);
   }
-
+  function sourceTag(r) {
+    if (r._source==='web_search') return ' <span style="color:var(--green);font-size:10px;font-weight:600">&#9679; live web</span>';
+    if (r._source==='training_data') return ' <span style="color:var(--text-muted);font-size:10px">&#9679; training data</span>';
+    return '';
+  }
   function renderTable() {
     const tbody = document.getElementById('results-tbody');
     const shown = filteredResults();
     let html = '';
-
     shown.forEach(r => {
       const ex = expanded[r.ticker];
       const dc = r.distributions?.length || 0;
       const codes = allCodes(r);
       const hasReclass = r.distributions?.some(d => d.reclassified);
-
-      html += `<tr class="${dc ? 'clickable' : ''}" onclick="${dc ? `toggleRow('${esc(r.ticker)}')` : ''}">
+      html += `<tr class="${dc?'clickable':''}" onclick="${dc?`toggleRow('${esc(r.ticker)}')`:''}" >
         <td class="mono" style="font-weight:500">${esc(r.ticker)}</td>
-        <td class="mono" style="color:var(--text-secondary)">${esc(r.isin || '')}</td>
+        <td class="mono" style="color:var(--text-secondary)">${esc(r.isin||'')}</td>
         <td>
-          <div class="fund-name">${esc(r.fund_name || r.ticker)}</div>
-          <div class="fund-sub">${esc(r.fund_manager || '')}${r.strategy ? ' · ' + r.strategy : ''}</div>
+          <div class="fund-name">${esc(r.fund_name||r.ticker)}</div>
+          <div class="fund-sub">${esc(r.fund_manager||'')}${r.strategy?' · '+esc(r.strategy):''}${sourceTag(r)}</div>
         </td>
-        <td style="text-align:center;color:var(--text-secondary)">${dc || '<span style="color:var(--text-muted)">—</span>'}</td>
-        <td>${codes.length ? codes.map(codeBadge).join(' ') + (hasReclass ? ' <span class="badge badge-reclass">reclassified</span>' : '') : '<span style="color:var(--text-muted);font-size:12px">—</span>'}</td>
+        <td style="text-align:center;color:var(--text-secondary)">${dc||'<span style="color:var(--text-muted)">—</span>'}</td>
+        <td>${codes.length?codes.map(codeBadge).join(' ')+(hasReclass?' <span class="badge badge-reclass">reclassified</span>':''):'<span style="color:var(--text-muted);font-size:12px">—</span>'}</td>
         <td>${riskBadge(r.reclassification_risk)}</td>
-        <td class="expand-arrow" style="text-align:center">${dc ? (ex ? '▾' : '▸') : ''}</td>
+        <td class="expand-arrow" style="text-align:center">${dc?(ex?'&#9662;':'&#9656;'):''}</td>
       </tr>`;
-
-      if (r._status === 'error') {
-        html += `<tr class="error-row"><td colspan="7"><strong>${esc(r.ticker)}:</strong> ${esc(r._error || 'Unknown error')}</td></tr>`;
-      }
-
-      if (ex && dc) {
-        html += `<tr class="expanded-row"><td colspan="7"><div class="sub-table-wrap">
-          <table class="sub-table">
-            <thead><tr>
-              <th>Record date</th>
-              <th>Payment date</th>
-              <th>Total / share</th>
-              <th>Code 1</th>
-              <th>Amount 1 / share</th>
-              <th>Code 2</th>
-              <th>Amount 2 / share</th>
-              <th>Reclassified</th>
-              <th>Confidence</th>
-              <th>Notes</th>
-            </tr></thead>
-            <tbody>`;
-
-        r.distributions.forEach(d => {
-          const c1 = d.components?.[0] || null;
-          const c2 = d.components?.[1] || null;
-          html += `<tr>
-            <td class="mono">${esc(d.record_date || '—')}</td>
-            <td class="mono" style="color:var(--text-muted)">${esc(d.payment_date || '—')}</td>
-            <td class="mono" style="font-weight:500">${fmtAmount(d.total_per_share)}</td>
-            <td>${c1 ? codeBadge(c1.income_code) : '<span style="color:var(--text-muted)">—</span>'}</td>
-            <td class="mono">${c1 ? fmtAmount(c1.per_share) + (c1.percentage != null && c1.percentage !== 100 ? ' <span style="color:var(--text-muted);font-size:10px">(' + c1.percentage + '%)</span>' : '') : '—'}</td>
-            <td>${c2 ? codeBadge(c2.income_code) : '<span style="color:var(--text-muted)">—</span>'}</td>
-            <td class="mono">${c2 ? fmtAmount(c2.per_share) + ' <span style="color:var(--text-muted);font-size:10px">(' + c2.percentage + '%)</span>' : '<span style="color:var(--text-muted)">—</span>'}</td>
-            <td>${d.reclassified ? '<span class="badge badge-reclass">YES</span>' : '<span style="color:var(--text-muted)">—</span>'}</td>
-            <td style="color:var(--text-muted)">${esc(d.confidence || '—')}</td>
-            <td style="max-width:180px;font-size:11px;color:var(--text-secondary)">${esc(d.notes || '')}</td>
+      if (r._status==='error') html+=`<tr class="error-row"><td colspan="7"><strong>${esc(r.ticker)}:</strong> ${esc(r._error||'Unknown error')}</td></tr>`;
+      if (ex&&dc) {
+        html+=`<tr class="expanded-row"><td colspan="7"><div class="sub-table-wrap">
+          <table class="sub-table"><thead><tr>
+            <th>Record date</th><th>Payment date</th><th>Total/share</th>
+            <th>Code 1</th><th>Amount 1</th><th>Code 2</th><th>Amount 2</th>
+            <th>Reclassified</th><th>Confidence</th><th>Notes</th>
+          </tr></thead><tbody>`;
+        r.distributions.forEach(d=>{
+          const c1=d.components?.[0]||null, c2=d.components?.[1]||null;
+          html+=`<tr>
+            <td class="mono">${esc(d.record_date||'—')}</td>
+            <td class="mono" style="color:var(--text-muted)">${esc(d.payment_date||'—')}</td>
+            <td class="mono" style="font-weight:500">${fmtAmt(d.total_per_share)}</td>
+            <td>${c1?codeBadge(c1.income_code):'<span style="color:var(--text-muted)">—</span>'}</td>
+            <td class="mono">${c1?fmtAmt(c1.per_share)+(c1.percentage!=null&&c1.percentage!==100?' <span style="color:var(--text-muted);font-size:10px">('+c1.percentage+'%)</span>':''):'—'}</td>
+            <td>${c2?codeBadge(c2.income_code):'<span style="color:var(--text-muted)">—</span>'}</td>
+            <td class="mono">${c2?fmtAmt(c2.per_share)+' <span style="color:var(--text-muted);font-size:10px">('+c2.percentage+'%)</span>':'<span style="color:var(--text-muted)">—</span>'}</td>
+            <td>${d.reclassified?'<span class="badge badge-reclass">YES</span>':'<span style="color:var(--text-muted)">—</span>'}</td>
+            <td style="color:var(--text-muted)">${esc(d.confidence||'—')}</td>
+            <td style="max-width:160px;font-size:11px;color:var(--text-secondary)">${esc(d.notes||'')}</td>
           </tr>`;
         });
-
-        html += `</tbody></table>`;
-        if (r.reclassification_notes) {
-          html += `<div class="reclass-notes">Reclassification notes: ${esc(r.reclassification_notes)}</div>`;
-        }
-        html += `</div></td></tr>`;
+        html+='</tbody></table>';
+        if(r.reclassification_notes) html+=`<div class="reclass-notes">Reclassification notes: ${esc(r.reclassification_notes)}</div>`;
+        html+='</div></td></tr>';
       }
     });
-
-    if (!html) {
-      html = `<tr><td colspan="7" style="text-align:center;padding:2rem;color:var(--text-muted)">No results match current filter</td></tr>`;
-    }
-
-    tbody.innerHTML = html;
+    if(!html) html=`<tr><td colspan="7" style="text-align:center;padding:2rem;color:var(--text-muted)">No results match current filter</td></tr>`;
+    tbody.innerHTML=html;
   }
-
-  function toggleRow(ticker) {
-    expanded[ticker] = !expanded[ticker];
-    renderTable();
-  }
+  function toggleRow(ticker) { expanded[ticker]=!expanded[ticker]; renderTable(); }
 
   // ─── Export ───────────────────────────────────────────────────────────────
   function exportCSV() {
-    const header = [
-      'Ticker', 'ISIN', 'Fund Name', 'Fund Manager', 'Strategy',
-      'Record Date', 'Payment Date', 'Total Per Share',
-      'Code 1', 'Type 1', 'Amount 1', 'Pct 1',
-      'Code 2', 'Type 2', 'Amount 2', 'Pct 2',
-      'Reclassified', 'Confidence', 'Reclass Risk', 'Reclass Notes', 'Notes'
-    ];
-    const rows = [header];
-
-    results.forEach(r => {
-      if (r.distributions?.length) {
-        r.distributions.forEach(d => {
-          const c1 = d.components?.[0] || {};
-          const c2 = d.components?.[1] || {};
-          rows.push([
-            r.ticker, r.isin, r.fund_name || '', r.fund_manager || '', r.strategy || '',
-            d.record_date || '', d.payment_date || '', d.total_per_share ?? '',
-            c1.income_code || '', c1.income_type || '', c1.per_share ?? '', c1.percentage ?? '',
-            c2.income_code || '', c2.income_type || '', c2.per_share ?? '', c2.percentage ?? '',
-            d.reclassified ? 'YES' : 'no', d.confidence || '',
-            r.reclassification_risk || '', r.reclassification_notes || '', d.notes || ''
-          ]);
+    const header=['Ticker','ISIN','Fund Name','Fund Manager','Strategy','Data Source',
+      'Record Date','Payment Date','Total Per Share',
+      'Code 1','Type 1','Amount 1','Pct 1','Code 2','Type 2','Amount 2','Pct 2',
+      'Reclassified','Confidence','Reclass Risk','Reclass Notes','Notes'];
+    const rows=[header];
+    results.forEach(r=>{
+      if(r.distributions?.length){
+        r.distributions.forEach(d=>{
+          const c1=d.components?.[0]||{}, c2=d.components?.[1]||{};
+          rows.push([r.ticker,r.isin,r.fund_name||'',r.fund_manager||'',r.strategy||'',r._source||'',
+            d.record_date||'',d.payment_date||'',d.total_per_share??'',
+            c1.income_code||'',c1.income_type||'',c1.per_share??'',c1.percentage??'',
+            c2.income_code||'',c2.income_type||'',c2.per_share??'',c2.percentage??'',
+            d.reclassified?'YES':'no',d.confidence||'',
+            r.reclassification_risk||'',r.reclassification_notes||'',d.notes||'']);
         });
       } else {
-        rows.push([r.ticker, r.isin, r.fund_name || '', r.fund_manager || '', r.strategy || '',
-          '', '', '', '', '', '', '', '', '', '', '', '', '',
-          r.reclassification_risk || '', r.reclassification_notes || '', r._error || '']);
+        rows.push([r.ticker,r.isin,r.fund_name||'',r.fund_manager||'',r.strategy||'',r._source||'',
+          '','','','','','','','','','','','','',
+          r.reclassification_risk||'',r.reclassification_notes||'',r._error||'']);
       }
     });
-
-    const csv = rows.map(r => r.map(c => `"${String(c ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
-    const a = Object.assign(document.createElement('a'), {
-      href: URL.createObjectURL(new Blob([csv], { type: 'text/csv' })),
-      download: 'qi_income_analysis_' + new Date().toISOString().slice(0, 10) + '.csv'
-    });
-    a.click();
+    const csv=rows.map(r=>r.map(c=>`"${String(c??'').replace(/"/g,'""')}"`).join(',')).join('\n');
+    Object.assign(document.createElement('a'),{
+      href:URL.createObjectURL(new Blob([csv],{type:'text/csv'})),
+      download:'qi_income_analysis_'+new Date().toISOString().slice(0,10)+'.csv'
+    }).click();
   }
 </script>
 </body>
