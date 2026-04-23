@@ -355,6 +355,36 @@ SNOY, US88636J7744</textarea>
         </div>
       </div>
     </div>
+
+    <!-- Saved results library -->
+    <div class="card" id="history-card" style="display:none;margin-top:1.5rem">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;flex-wrap:wrap;gap:8px">
+        <div>
+          <div class="card-title">Saved results library</div>
+          <div style="font-size:12px;color:var(--text-muted);margin-top:2px" id="history-sub"></div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-primary" onclick="viewSavedResults()">View all saved →</button>
+          <button class="btn btn-secondary" style="color:var(--red-text)" onclick="confirmClearHistory()">Clear all</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto;border:1px solid var(--border);border-radius:var(--radius)">
+        <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:500px">
+          <thead>
+            <tr style="background:var(--bg);border-bottom:1px solid var(--border-strong)">
+              <th style="padding:8px 10px;text-align:left;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em">Ticker</th>
+              <th style="padding:8px 10px;text-align:left;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em">Fund</th>
+              <th style="padding:8px 10px;text-align:left;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em">Codes</th>
+              <th style="padding:8px 10px;text-align:left;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em">Risk</th>
+              <th style="padding:8px 10px;text-align:left;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em">Payments</th>
+              <th style="padding:8px 10px;text-align:left;font-weight:600;color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em">Analyzed</th>
+              <th style="padding:8px 10px;width:80px"></th>
+            </tr>
+          </thead>
+          <tbody id="history-tbody"></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <!-- RESULTS SCREEN -->
@@ -499,6 +529,7 @@ SNOY, US88636J7744</textarea>
       try {
         const r = await analyzeETF(ticker, isin, name);
         results.push({ ...r, _status: 'ok' });
+        saveResultToHistory(r);
       } catch (e) {
         // If password required, show overlay then retry
         if (e.message === 'PASSWORD_REQUIRED') {
@@ -561,6 +592,7 @@ SNOY, US88636J7744</textarea>
   function goBack() {
     document.getElementById('screen-results').classList.add('hidden');
     document.getElementById('screen-input').classList.remove('hidden');
+    renderHistory();
   }
 
   // ─── Password handling ────────────────────────────────────────────────────
@@ -716,6 +748,86 @@ SNOY, US88636J7744</textarea>
       download:'qi_income_analysis_'+new Date().toISOString().slice(0,10)+'.csv'
     }).click();
   }
+
+  // ─── Local storage / history ──────────────────────────────────────────────
+  const STORAGE_KEY = 'qi_tracker_v1';
+
+  function loadHistory() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
+    catch (_) { return []; }
+  }
+
+  function saveResultToHistory(r) {
+    if (!r || !r.ticker || r._status === 'error') return;
+    const history = loadHistory();
+    const idx = history.findIndex(h => h.ticker === r.ticker);
+    const entry = { ...r, _analyzed_at: new Date().toISOString() };
+    if (idx >= 0) history[idx] = entry;
+    else history.push(entry);
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(history)); } catch (_) {}
+  }
+
+  function deleteFromHistory(ticker) {
+    const history = loadHistory().filter(h => h.ticker !== ticker);
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(history)); } catch (_) {}
+    renderHistory();
+  }
+
+  function confirmClearHistory() {
+    if (confirm('Delete all ' + loadHistory().length + ' saved results?')) {
+      localStorage.removeItem(STORAGE_KEY);
+      renderHistory();
+    }
+  }
+
+  function viewSavedResults() {
+    const history = loadHistory();
+    if (!history.length) return;
+    results = history.map(h => ({ ...h, _status: 'ok' }));
+    expanded = {};
+    document.getElementById('screen-input').classList.add('hidden');
+    document.getElementById('screen-results').classList.remove('hidden');
+    document.getElementById('stop-btn').classList.add('hidden');
+    document.getElementById('export-btn').classList.remove('hidden');
+    document.getElementById('progress-wrap').style.display = 'none';
+    document.getElementById('stats-grid').style.display = '';
+    document.getElementById('results-table-section').style.display = '';
+    document.getElementById('results-sub').textContent = history.length + ' saved instruments';
+    updateStats();
+    renderTable();
+  }
+
+  function renderHistory() {
+    const history = loadHistory();
+    const card = document.getElementById('history-card');
+    const tbody = document.getElementById('history-tbody');
+    const sub = document.getElementById('history-sub');
+    if (!history.length) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    sub.textContent = history.length + ' instrument' + (history.length !== 1 ? 's' : '') + ' saved';
+    const sorted = [...history].sort((a, b) => new Date(b._analyzed_at) - new Date(a._analyzed_at));
+    tbody.innerHTML = sorted.map(r => {
+      const codes = new Set();
+      (r.distributions || []).forEach(d => (d.components || []).forEach(c => { if (c.income_code) codes.add(c.income_code); }));
+      const codeStr = [...codes].map(c => `<span class="badge badge-${c}" style="font-size:10px;padding:1px 6px">${c}</span>`).join(' ') || '<span style="color:var(--text-muted)">—</span>';
+      const date = r._analyzed_at ? new Date(r._analyzed_at).toLocaleDateString('en-GB', {day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+      const dc = r.distributions?.length || 0;
+      return `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:8px 10px;font-family:'JetBrains Mono',monospace;font-weight:500;font-size:12px">${esc(r.ticker)}</td>
+        <td style="padding:8px 10px;font-size:12px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.fund_name||'')}</td>
+        <td style="padding:8px 10px">${codeStr}</td>
+        <td style="padding:8px 10px">${riskBadge(r.reclassification_risk)}</td>
+        <td style="padding:8px 10px;color:var(--text-secondary);font-size:12px">${dc}</td>
+        <td style="padding:8px 10px;color:var(--text-muted);font-size:11px;white-space:nowrap">${date}</td>
+        <td style="padding:8px 10px;text-align:right">
+          <button onclick="deleteFromHistory('${esc(r.ticker)}')" style="font-size:11px;padding:2px 8px;cursor:pointer;border:1px solid var(--border-strong);border-radius:var(--radius);background:transparent;color:var(--text-muted)">Remove</button>
+        </td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Initialise history on page load
+  renderHistory();
 </script>
 </body>
 </html>
