@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -619,10 +620,21 @@ SNOY, US88636J7744</textarea>
   }
 
   // ─── Table rendering ──────────────────────────────────────────────────────
+  function allCodes(r) {
+    const codes = new Set();
+    (r.distributions || []).forEach(d => (d.components || []).forEach(c => { if (c.income_code) codes.add(c.income_code); }));
+    return [...codes];
+  }
+
   function filteredResults() {
     if (currentFilter === 'high') return results.filter(r => r.reclassification_risk === 'high');
     if (currentFilter === 'reclassified') return results.filter(r => r.distributions?.some(d => d.reclassified));
     return results;
+  }
+
+  function fmtAmount(v) {
+    if (v === null || v === undefined) return '<span style="color:var(--text-muted)">—</span>';
+    return '$' + Number(v).toFixed(4);
   }
 
   function renderTable() {
@@ -633,7 +645,7 @@ SNOY, US88636J7744</textarea>
     shown.forEach(r => {
       const ex = expanded[r.ticker];
       const dc = r.distributions?.length || 0;
-      const codes = [...new Set((r.distributions || []).map(d => d.income_code).filter(Boolean))];
+      const codes = allCodes(r);
       const hasReclass = r.distributions?.some(d => d.reclassified);
 
       html += `<tr class="${dc ? 'clickable' : ''}" onclick="${dc ? `toggleRow('${esc(r.ticker)}')` : ''}">
@@ -657,29 +669,40 @@ SNOY, US88636J7744</textarea>
         html += `<tr class="expanded-row"><td colspan="7"><div class="sub-table-wrap">
           <table class="sub-table">
             <thead><tr>
-              <th>Record date</th><th>Payment date</th><th>Income type</th>
-              <th>Code</th><th>Confidence</th><th>Reclassified</th><th>Notes</th>
+              <th>Record date</th>
+              <th>Payment date</th>
+              <th>Total / share</th>
+              <th>Code 1</th>
+              <th>Amount 1 / share</th>
+              <th>Code 2</th>
+              <th>Amount 2 / share</th>
+              <th>Reclassified</th>
+              <th>Confidence</th>
+              <th>Notes</th>
             </tr></thead>
             <tbody>`;
 
         r.distributions.forEach(d => {
+          const c1 = d.components?.[0] || null;
+          const c2 = d.components?.[1] || null;
           html += `<tr>
             <td class="mono">${esc(d.record_date || '—')}</td>
             <td class="mono" style="color:var(--text-muted)">${esc(d.payment_date || '—')}</td>
-            <td>${esc(d.income_type || '—')}</td>
-            <td>${codeBadge(d.income_code)}</td>
-            <td style="color:var(--text-muted)">${esc(d.confidence || '—')}</td>
+            <td class="mono" style="font-weight:500">${fmtAmount(d.total_per_share)}</td>
+            <td>${c1 ? codeBadge(c1.income_code) : '<span style="color:var(--text-muted)">—</span>'}</td>
+            <td class="mono">${c1 ? fmtAmount(c1.per_share) + (c1.percentage != null && c1.percentage !== 100 ? ' <span style="color:var(--text-muted);font-size:10px">(' + c1.percentage + '%)</span>' : '') : '—'}</td>
+            <td>${c2 ? codeBadge(c2.income_code) : '<span style="color:var(--text-muted)">—</span>'}</td>
+            <td class="mono">${c2 ? fmtAmount(c2.per_share) + ' <span style="color:var(--text-muted);font-size:10px">(' + c2.percentage + '%)</span>' : '<span style="color:var(--text-muted)">—</span>'}</td>
             <td>${d.reclassified ? '<span class="badge badge-reclass">YES</span>' : '<span style="color:var(--text-muted)">—</span>'}</td>
-            <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis">${esc(d.notes || '')}</td>
+            <td style="color:var(--text-muted)">${esc(d.confidence || '—')}</td>
+            <td style="max-width:180px;font-size:11px;color:var(--text-secondary)">${esc(d.notes || '')}</td>
           </tr>`;
         });
 
         html += `</tbody></table>`;
-
         if (r.reclassification_notes) {
           html += `<div class="reclass-notes">Reclassification notes: ${esc(r.reclassification_notes)}</div>`;
         }
-
         html += `</div></td></tr>`;
       }
     });
@@ -698,22 +721,33 @@ SNOY, US88636J7744</textarea>
 
   // ─── Export ───────────────────────────────────────────────────────────────
   function exportCSV() {
-    const header = ['Ticker', 'ISIN', 'Fund Name', 'Fund Manager', 'Strategy',
-      'Record Date', 'Payment Date', 'Income Type', 'Income Code',
-      'Confidence', 'Reclassified', 'Reclass Risk', 'Reclass Notes', 'Notes'];
+    const header = [
+      'Ticker', 'ISIN', 'Fund Name', 'Fund Manager', 'Strategy',
+      'Record Date', 'Payment Date', 'Total Per Share',
+      'Code 1', 'Type 1', 'Amount 1', 'Pct 1',
+      'Code 2', 'Type 2', 'Amount 2', 'Pct 2',
+      'Reclassified', 'Confidence', 'Reclass Risk', 'Reclass Notes', 'Notes'
+    ];
     const rows = [header];
 
     results.forEach(r => {
       if (r.distributions?.length) {
-        r.distributions.forEach(d => rows.push([
-          r.ticker, r.isin, r.fund_name, r.fund_manager, r.strategy,
-          d.record_date, d.payment_date || '', d.income_type, d.income_code,
-          d.confidence, d.reclassified ? 'YES' : 'no',
-          r.reclassification_risk, r.reclassification_notes || '', d.notes || ''
-        ]));
+        r.distributions.forEach(d => {
+          const c1 = d.components?.[0] || {};
+          const c2 = d.components?.[1] || {};
+          rows.push([
+            r.ticker, r.isin, r.fund_name || '', r.fund_manager || '', r.strategy || '',
+            d.record_date || '', d.payment_date || '', d.total_per_share ?? '',
+            c1.income_code || '', c1.income_type || '', c1.per_share ?? '', c1.percentage ?? '',
+            c2.income_code || '', c2.income_type || '', c2.per_share ?? '', c2.percentage ?? '',
+            d.reclassified ? 'YES' : 'no', d.confidence || '',
+            r.reclassification_risk || '', r.reclassification_notes || '', d.notes || ''
+          ]);
+        });
       } else {
-        rows.push([r.ticker, r.isin, r.fund_name || '', r.fund_manager || '', '',
-          '', '', '', '', '', '', r.reclassification_risk || '', '', r._error || '']);
+        rows.push([r.ticker, r.isin, r.fund_name || '', r.fund_manager || '', r.strategy || '',
+          '', '', '', '', '', '', '', '', '', '', '', '', '',
+          r.reclassification_risk || '', r.reclassification_notes || '', r._error || '']);
       }
     });
 
