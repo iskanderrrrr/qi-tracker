@@ -1,31 +1,68 @@
-// QI Tracker — Netlify serverless function v6
-// Uses Anthropic built-in web search, Node https module
+// QI Tracker — Netlify serverless function v7
+// Uses Brave Search API for web search (compact results, no token bloat)
 
 const https = require("https");
 
-function apiPost(apiKey, body) {
+// Generic HTTPS GET
+function httpsGet(hostname, path, headers) {
   return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
-    const options = {
-      hostname: "api.anthropic.com",
-      path: "/v1/messages",
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(payload),
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-    };
+    const options = { hostname, path, method: "GET", headers };
     const req = https.request(options, (res) => {
       let data = "";
-      res.on("data", (chunk) => { data += chunk; });
+      res.on("data", (c) => { data += c; });
+      res.on("end", () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+// Generic HTTPS POST
+function httpsPost(hostname, path, headers, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const opts = {
+      hostname, path, method: "POST",
+      headers: { ...headers, "Content-Length": Buffer.byteLength(payload) },
+    };
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.on("data", (c) => { data += c; });
       res.on("end", () => resolve({ status: res.statusCode, body: data }));
     });
     req.on("error", reject);
     req.write(payload);
     req.end();
   });
+}
+
+// Brave Search — returns compact snippets only
+async function braveSearch(apiKey, query, count = 5) {
+  const path = "/res/v1/web/search?q=" + encodeURIComponent(query) + "&count=" + count + "&search_lang=en";
+  const res = await httpsGet("api.search.brave.com", path, {
+    "Accept": "application/json",
+    "Accept-Encoding": "gzip",
+    "X-Subscription-Token": apiKey,
+  });
+  if (res.status !== 200) return [];
+  try {
+    const data = JSON.parse(res.body);
+    return (data.web?.results || []).map(r => ({
+      title: r.title || "",
+      url: r.url || "",
+      snippet: r.description || r.extra_snippets?.[0] || "",
+    }));
+  } catch (_) { return []; }
+}
+
+// Anthropic API call
+async function claudePost(apiKey, messages) {
+  const res = await httpsPost(
+    "api.anthropic.com", "/v1/messages",
+    { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+    { model: "claude-sonnet-4-6", max_tokens: 4096, messages }
+  );
+  return res;
 }
 
 exports.handler = async function (event) {
@@ -52,113 +89,107 @@ exports.handler = async function (event) {
                body: JSON.stringify({ error: "Invalid access password" }) };
     }
 
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (!anthropicKey) {
       return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
-               body: JSON.stringify({ error: "ANTHROPIC_API_KEY is not set in Netlify environment variables." }) };
+               body: JSON.stringify({ error: "ANTHROPIC_API_KEY is not set." }) };
     }
     if (!ticker) {
       return { statusCode: 400, headers: { ...CORS, "Content-Type": "application/json" },
                body: JSON.stringify({ error: "Ticker is required" }) };
     }
 
-    // First attempt: with web search
-    let result = await callClaude(apiKey, ticker, isin, name, true);
+    const braveKey = process.env.BRAVE_SEARCH_API_KEY;
 
-    // If web search failed (e.g. tool not available), fall back to training knowledge
-    if (result.error && result.useTraining) {
-      result = await callClaude(apiKey, ticker, isin, name, false);
+    // ── Step 1: Web search (if Brave key available) ───────────────────────
+    let searchContext = "";
+
+    if (braveKey) {
+      const fundLabel = name || ticker;
+      const [r1, r2, r3] = await Promise.all([
+        braveSearch(braveKey, `${ticker} ETF distribution record date payment date 2025 per share`, 5),
+        braveSearch(braveKey, `${ticker} ${fundLabel} income reclassification 19a-1 Form 8937 2024 2025`, 5),
+        braveSearch(braveKey, `${ticker} ETF dividend interest option premium income type classification`, 4),
+      ]);
+
+      const formatResults = (results, label) => {
+        if (!results.length) return "";
+        return `\n[${label}]\n` + results.map((r, i) =>
+          `${i + 1}. ${r.title}\n   ${r.snippet}\n   ${r.url}`
+        ).join("\n");
+      };
+
+      searchContext =
+        formatResults(r1, "Distributions & Record Dates") +
+        formatResults(r2, "Reclassification Notices") +
+        formatResults(r3, "Income Classification");
     }
 
-    if (result.error) {
+    // ── Step 2: Claude analysis ───────────────────────────────────────────
+    const prompt = buildPrompt(ticker, isin, name, searchContext);
+
+    const apiRes = await claudePost(anthropicKey, [{ role: "user", content: prompt }]);
+
+    if (apiRes.status < 200 || apiRes.status >= 300) {
+      let errMsg = "Anthropic API error (HTTP " + apiRes.status + ")";
+      try { errMsg = JSON.parse(apiRes.body).error?.message || errMsg; } catch (_) {}
+      return { statusCode: apiRes.status, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: errMsg }) };
+    }
+
+    let apiData;
+    try { apiData = JSON.parse(apiRes.body); }
+    catch (e) {
       return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
-               body: JSON.stringify({ error: result.error }) };
+               body: JSON.stringify({ error: "Cannot parse Anthropic response: " + e.message }) };
     }
+
+    const textContent = (apiData.content || [])
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+
+    if (!textContent) {
+      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: "No text in response. stop_reason=" + (apiData.stop_reason || "?") }) };
+    }
+
+    // Find the last complete JSON object in the response
+    const lastBrace = textContent.lastIndexOf("}");
+    if (lastBrace === -1) {
+      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: "No JSON in response: " + textContent.slice(0, 200) }) };
+    }
+
+    let depth = 0, jsonStart = -1;
+    for (let i = lastBrace; i >= 0; i--) {
+      if (textContent[i] === "}") depth++;
+      else if (textContent[i] === "{") { depth--; if (depth === 0) { jsonStart = i; break; } }
+    }
+
+    if (jsonStart === -1) {
+      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: "Cannot find JSON boundaries" }) };
+    }
+
+    let result;
+    try {
+      result = JSON.parse(textContent.slice(jsonStart, lastBrace + 1));
+    } catch (_) {
+      result = recoverPartialJson(textContent.slice(jsonStart), ticker, isin, name);
+    }
+
+    // Tag whether result came from web search or training data
+    result._source = braveKey ? "web_search" : "training_data";
 
     return { statusCode: 200, headers: { ...CORS, "Content-Type": "application/json" },
-             body: JSON.stringify(result.data) };
+             body: JSON.stringify(result) };
 
   } catch (err) {
     return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
              body: JSON.stringify({ error: "Function error (" + ticker + "): " + err.message }) };
   }
 };
-
-async function callClaude(apiKey, ticker, isin, name, useWebSearch) {
-  const requestBody = {
-    model: "claude-sonnet-4-6",
-    max_tokens: 8192,
-    messages: [{ role: "user", content: buildPrompt(ticker, isin, name, useWebSearch) }],
-  };
-
-  if (useWebSearch) {
-    requestBody.tools = [{ type: "web_search_20250305", name: "web_search" }];
-  }
-
-  const response = await apiPost(apiKey, requestBody);
-
-  if (response.status < 200 || response.status >= 300) {
-    let errMsg = "Anthropic API error (HTTP " + response.status + ")";
-    try {
-      const parsed = JSON.parse(response.body);
-      errMsg = parsed.error?.message || errMsg;
-      // If error mentions the tool is not available, signal fallback
-      if (useWebSearch && (errMsg.includes("tool") || errMsg.includes("web_search") || response.status === 400)) {
-        return { error: errMsg, useTraining: true };
-      }
-    } catch (_) {}
-    return { error: errMsg };
-  }
-
-  let data;
-  try { data = JSON.parse(response.body); }
-  catch (e) { return { error: "Cannot parse Anthropic response: " + e.message }; }
-
-  // Extract all text content blocks (skip tool_use, tool_result blocks)
-  const textContent = (data.content || [])
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n");
-
-  if (!textContent) {
-    const types = (data.content || []).map(b => b.type).join(", ");
-    // If web search was used but produced no text, try falling back
-    if (useWebSearch) {
-      return { error: "No text in response (types: " + types + ")", useTraining: true };
-    }
-    return { error: "No text in response. stop_reason=" + (data.stop_reason || "?") + " types=" + types };
-  }
-
-  // Find the JSON object — look for the LAST { } block as that's the final answer
-  const lastBrace = textContent.lastIndexOf("}");
-  if (lastBrace === -1) {
-    return { error: "No JSON found in response: " + textContent.slice(0, 200) };
-  }
-
-  // Walk backwards from the last } to find its matching {
-  let depth = 0;
-  let jsonStart = -1;
-  for (let i = lastBrace; i >= 0; i--) {
-    if (textContent[i] === "}") depth++;
-    else if (textContent[i] === "{") {
-      depth--;
-      if (depth === 0) { jsonStart = i; break; }
-    }
-  }
-
-  if (jsonStart === -1) {
-    return { error: "Cannot find JSON boundaries in response" };
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(textContent.slice(jsonStart, lastBrace + 1));
-  } catch (_) {
-    parsed = recoverPartialJson(textContent.slice(jsonStart), ticker, isin, name);
-  }
-
-  return { data: parsed };
-}
 
 function recoverPartialJson(partial, ticker, isin, name) {
   const result = {
@@ -174,42 +205,35 @@ function recoverPartialJson(partial, ticker, isin, name) {
   return result;
 }
 
-function buildPrompt(ticker, isin, name, useWebSearch) {
-  const searchInstruction = useWebSearch
-    ? `Search the web for the following information about this ETF:
-1. All distribution payments made in 2025 with their exact record dates and payment dates
-2. Per-share distribution amounts for each payment
-3. SEC EDGAR Form 8937 filings for this fund (search "site:sec.gov 8937 ${ticker}")
-4. Any 19a-1 notices or tax character announcements from the fund company
-5. Any year-end income reclassification announcements
+function buildPrompt(ticker, isin, name, searchContext) {
+  const hasSearch = searchContext && searchContext.trim().length > 0;
 
-Use multiple searches to gather accurate data before producing your answer.`
-    : `Use your training knowledge to provide the best available information about this ETF's 2025 distributions.`;
-
-  return `You are a QI (qualified intermediary) tax specialist. Analyze this US ETF's distributions and provide detailed income classification including per-share amounts and any reclassifications.
+  return `You are a QI (qualified intermediary) tax specialist. Analyze this US ETF's distributions for 2025.
 
 ETF: ${ticker}${isin ? " | ISIN: " + isin : ""}${name ? " | " + name : ""}
 
-${searchInstruction}
+${hasSearch ? `== WEB SEARCH RESULTS ==
+Use the following search results as your primary source. Prefer this data over your training knowledge.
+${searchContext}
+== END OF SEARCH RESULTS ==` : `No web search results available — use your training knowledge.`}
 
 CRITICAL DEFINITIONS:
-- RECORD DATE: The date an investor must appear on the shareholder register to receive the distribution. Typically 1 business day AFTER the ex-dividend date, and always BEFORE the payment date.
-- PAYMENT DATE: The actual cash payment date, typically 1-2 weeks after the record date.
-- Do NOT confuse these two dates. They are always different.
+- RECORD DATE: Date investor must be on shareholder register to receive distribution. Always BEFORE the payment date (typically 1 business day after ex-dividend date).
+- PAYMENT DATE: Date cash is actually paid. Always AFTER the record date (typically 1-2 weeks later).
+- Never confuse or swap these two dates.
 
 INCOME CODE RULES:
-- "01" = Interest income → T-bill ETFs (BIL, SHV, SGOV, USFR), bond ETFs (AGG, BND, TIP, VTIP, SCHP, JPST, NEAR)
-- "06" = Ordinary dividend → equity ETFs (SPY, IVV, VOO, QQQ, VTI, VYM, SCHD, DVY)
-- "37" = Other income / option premium → ALL YieldMax ETFs (TSLY, NVDY, MSFO, AMZY, GOOGY, SMCY, MARO, SNOY, CONY, NVOY, APLY, JPMO, etc.), JEPI, JEPQ, GPIX, XDTE, QDTE, and any covered-call or option-income ETF
+- "01" = Interest → T-bill/bond ETFs: BIL, SHV, SGOV, USFR, AGG, BND, TIP, VTIP, SCHP, JPST, NEAR
+- "06" = Ordinary dividend → equity ETFs: SPY, IVV, VOO, QQQ, VTI, VYM, SCHD, DVY
+- "37" = Other income / option premium → YieldMax ETFs (TSLY, NVDY, MSFO, AMZY, GOOGY, SMCY, MARO, SNOY, CONY, NVOY, APLY, JPMO, etc.), JEPI, JEPQ, GPIX, XDTE, QDTE
 - "40" = Return of capital
 
 RECLASSIFICATION:
-- A reclassification occurs when a fund restates the income character after initial reporting (via 19a-1 or Form 8937)
-- A single distribution can be SPLIT across two codes (e.g. 70% Code 37 + 30% Code 40)
-- Report the FINAL restated character; set "reclassified": true if original was changed
-- Include the per-share amount for each component of a split
+- Set "reclassified": true if a distribution's income character was restated after initial reporting
+- A distribution can be split: e.g. 70% Code 37 + 30% Code 40 — show both as separate components
+- Report the final restated character, not the original
 
-List distributions for 2025 only. Return ONLY the JSON object below — no explanation, no markdown, no text before or after:
+List 2025 distributions only. Return ONLY the JSON object — no explanation, no markdown:
 
 {
   "ticker": "${ticker}",
