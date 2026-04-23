@@ -1,5 +1,5 @@
-// QI Tracker — Netlify serverless function v2
-// Uses Claude training knowledge (no web search), comprehensive error handling
+// QI Tracker — Netlify serverless function v3
+// Fixes: max_tokens increased, correct model name, leaner prompt, partial JSON recovery
 
 exports.handler = async function (event) {
   const CORS = {
@@ -16,23 +16,26 @@ exports.handler = async function (event) {
   try {
     const body = JSON.parse(event.body || "{}");
     ticker = body.ticker || "";
-    isin = body.isin || "";
-    name = body.name || "";
+    isin   = body.isin   || "";
+    name   = body.name   || "";
 
+    // Optional password protection
     const requiredPw = process.env.ACCESS_PASSWORD;
     if (requiredPw && body.password !== requiredPw) {
-      return { statusCode: 401, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: "Invalid access password" }) };
+      return { statusCode: 401, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: "Invalid access password" }) };
     }
 
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
-      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: "ANTHROPIC_API_KEY is not set in Netlify environment variables." }) };
+      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: "ANTHROPIC_API_KEY is not set in Netlify environment variables." }) };
     }
     if (!ticker) {
-      return { statusCode: 400, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: "Ticker is required" }) };
+      return { statusCode: 400, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: "Ticker is required" }) };
     }
 
-    // Call Anthropic API — no tools, pure model knowledge
     const apiResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -42,7 +45,7 @@ exports.handler = async function (event) {
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-6",
-        max_tokens: 2048,
+        max_tokens: 8192,
         messages: [{ role: "user", content: buildPrompt(ticker, isin, name) }],
       }),
     });
@@ -50,91 +53,128 @@ exports.handler = async function (event) {
     const rawText = await apiResponse.text();
 
     if (!apiResponse.ok) {
-      let errMsg = "Anthropic API returned HTTP " + apiResponse.status;
+      let errMsg = "Anthropic API error (HTTP " + apiResponse.status + ")";
       try { errMsg = JSON.parse(rawText).error?.message || errMsg; } catch (_) {}
-      return { statusCode: apiResponse.status, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: errMsg }) };
+      return { statusCode: apiResponse.status, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: errMsg }) };
     }
 
     let data;
     try { data = JSON.parse(rawText); }
     catch (e) {
-      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: "Cannot parse Anthropic response: " + e.message, raw: rawText.slice(0, 300) }) };
+      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: "Cannot parse Anthropic envelope: " + e.message }) };
     }
 
-    const textContent = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+    const textContent = (data.content || [])
+      .filter(b => b.type === "text")
+      .map(b => b.text)
+      .join("");
 
     if (!textContent) {
-      const types = (data.content || []).map(b => b.type).join(", ");
-      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: "No text in response. stop_reason=" + (data.stop_reason || "?") + " content_types=" + (types || "none") }) };
+      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: "No text in response. stop_reason=" + (data.stop_reason || "?") }) };
     }
 
     const start = textContent.indexOf("{");
-    const end = textContent.lastIndexOf("}");
+    const end   = textContent.lastIndexOf("}");
 
     if (start === -1) {
-      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: "No JSON found. Model said: " + textContent.slice(0, 200) }) };
+      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
+               body: JSON.stringify({ error: "No JSON found in response: " + textContent.slice(0, 200) }) };
     }
 
     let result;
-    try { result = JSON.parse(textContent.slice(start, end + 1)); }
-    catch (e) {
-      return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: "JSON parse failed: " + e.message + ". Near: " + textContent.slice(start, start + 100) }) };
+
+    if (end > start) {
+      // Normal case — try to parse the full JSON
+      try {
+        result = JSON.parse(textContent.slice(start, end + 1));
+      } catch (_) {
+        // JSON is malformed — try to recover the partial object
+        result = recoverPartialJson(textContent.slice(start), ticker, isin, name);
+      }
+    } else {
+      // end <= start means truncated — recover partial
+      result = recoverPartialJson(textContent.slice(start), ticker, isin, name);
     }
 
-    return { statusCode: 200, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify(result) };
+    return { statusCode: 200, headers: { ...CORS, "Content-Type": "application/json" },
+             body: JSON.stringify(result) };
 
   } catch (err) {
-    return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" }, body: JSON.stringify({ error: "Function error (" + ticker + "): " + err.message }) };
+    return { statusCode: 500, headers: { ...CORS, "Content-Type": "application/json" },
+             body: JSON.stringify({ error: "Function error (" + ticker + "): " + err.message }) };
   }
 };
 
+// Attempt to recover usable data from a truncated/broken JSON string
+function recoverPartialJson(partial, ticker, isin, name) {
+  const result = {
+    ticker: ticker,
+    isin: isin,
+    fund_name: name || ticker,
+    fund_manager: "",
+    strategy: "",
+    distributions: [],
+    reclassification_risk: "unknown",
+    reclassification_notes: "Response was truncated — partial data recovered.",
+    _truncated: true,
+  };
+
+  // Extract simple string fields
+  const fields = ["fund_name", "fund_manager", "strategy", "reclassification_risk", "reclassification_notes"];
+  fields.forEach(field => {
+    const m = partial.match(new RegExp('"' + field + '"\\s*:\\s*"([^"]*)"'));
+    if (m) result[field] = m[1];
+  });
+
+  // Extract any complete distribution objects
+  const distPattern = /\{[^{}]*"record_date"[^{}]*"income_code"[^{}]*\}/g;
+  const distMatches = partial.match(distPattern) || [];
+  distMatches.forEach(distStr => {
+    try {
+      const d = JSON.parse(distStr);
+      if (d.record_date && d.income_code) result.distributions.push(d);
+    } catch (_) {}
+  });
+
+  return result;
+}
+
 function buildPrompt(ticker, isin, name) {
-  return `You are a qualified intermediary (QI) tax specialist with expert knowledge of US ETF income classification for withholding tax purposes.
+  return `You are a QI (qualified intermediary) tax specialist. Classify the income type for this US ETF's distributions.
 
-Analyze this ETF using your training knowledge:
-- Ticker: ${ticker}
-- ISIN: ${isin || "not provided"}
-${name ? `- Name: ${name}` : ""}
+ETF: ${ticker}${isin ? " | ISIN: " + isin : ""}${name ? " | " + name : ""}
 
-Determine the correct QI income codes for all distributions made in 2024 and 2025.
+IMPORTANT: Return ONLY a JSON object. No explanation, no markdown, no text before or after the JSON.
 
-Income code rules:
-- Code 01 = Interest income: T-bills, treasuries, bonds, money market. Use for: BIL, SHV, SGOV, USFR, JPST, AGG, BND, TIP, VTIP, SCHP, STIP, and all bond/treasury ETFs
-- Code 06 = Ordinary dividend: equity dividends. Use for: SPY, IVV, VOO, QQQ, VTI, dividend ETFs like DVY, SDY, VYM, SCHD
-- Code 37 = Other US source income: option premiums. Use for: ALL YieldMax ETFs (TSLY, NVDY, MSFO, AMZY, GOOGY, SMCY, MARO, SNOY, CONY, etc.), JEPI, JEPQ, GPIX, XDTE, QDTE, and any covered call / option income strategy ETF
-- Code 40 = Return of capital: non-taxable return of principal
+Use these QI income codes:
+- "01" = Interest (T-bills, bonds, money market) → BIL, SHV, SGOV, USFR, AGG, BND, TIP, VTIP, SCHP, JPST, NEAR
+- "06" = Ordinary dividend (equity dividends) → SPY, IVV, VOO, QQQ, VTI, VYM, SCHD, DVY
+- "37" = Other income / option premium → ALL YieldMax ETFs (TSLY, NVDY, MSFO, AMZY, GOOGY, SMCY, MARO, SNOY, CONY, NVOY, APLY, MSFO, JPMO etc.), JEPI, JEPQ, GPIX, XDTE, QDTE, any covered-call or option-income ETF
+- "40" = Return of capital → ROC distributions
 
-Key facts:
-- YieldMax ETFs distribute option premium income — always Code 37 with high reclassification risk
-- YieldMax and similar option ETFs pay monthly
-- T-Bill ETFs (BIL, SHV, SGOV) pay monthly interest — Code 01
-- Aggregate bond ETFs (AGG, BND) pay monthly interest — Code 01
-- TIPS ETFs (TIP, VTIP, SCHP) pay monthly interest + inflation adjustment — Code 01
-- JPST (JPMorgan Ultra-Short Income) pays monthly interest — Code 01
-- Reclassification risk is HIGH for option income ETFs, MEDIUM for mixed strategy ETFs, LOW for pure bond/T-bill ETFs
+List distributions for 2025 only (Jan–Apr 2025 confirmed, May–Dec 2025 estimated). Monthly payers: list every month. Quarterly payers: list each quarter. Use last business day of each month as the record date.
 
-For 2024 and 2025, list monthly distributions for monthly-paying funds (approximately 12 per year), or quarterly for quarterly-paying funds. Use the typical record dates (usually the last business day of each month for monthly payers).
-
-Return ONLY a valid JSON object with absolutely no other text before or after it:
+JSON format (return this exactly, filled in):
 {
   "ticker": "${ticker}",
   "isin": "${isin || ""}",
-  "fund_name": "full official name",
-  "fund_manager": "investment manager",
-  "strategy": "one-line strategy e.g. T-Bill ETF / Option Income ETF / Aggregate Bond ETF",
+  "fund_name": "full name",
+  "fund_manager": "manager name",
+  "strategy": "one-line description",
   "distributions": [
     {
-      "record_date": "YYYY-MM-DD",
-      "payment_date": "YYYY-MM-DD",
-      "income_type": "e.g. T-Bill Interest / Option Premium / Ordinary Dividend / Return of Capital",
-      "income_code": "01 or 06 or 37 or 40",
-      "confidence": "high or medium or low",
-      "source": "basis for this classification",
+      "record_date": "2025-01-31",
+      "income_type": "e.g. T-Bill Interest",
+      "income_code": "01",
+      "confidence": "high",
       "reclassified": false,
       "notes": ""
     }
   ],
-  "reclassification_risk": "high or medium or low",
-  "reclassification_notes": "explanation of reclassification risk specific to this fund"
+  "reclassification_risk": "low",
+  "reclassification_notes": "brief explanation"
 }`;
 }
